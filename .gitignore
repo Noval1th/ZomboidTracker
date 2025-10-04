@@ -4,6 +4,10 @@
 death_stats.json
 player_stats.json
 
+#Local Files to create
+start_monitor.bat
+start_monitor_hidden.vbs
+
 # Python
 __pycache__/
 *.py[cod]
