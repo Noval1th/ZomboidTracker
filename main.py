@@ -239,10 +239,11 @@ def send_leaderboard(leaderboard_type="death"):
         }
     
     elif leaderboard_type == "survival":
-        # Longest survival streaks
+        # Longest survival streaks - use current hours for alive players
         sorted_players = sorted(
             [(name, data) for name, data in player_stats.items()],
-            key=lambda x: x[1]['lifetime_stats']['longest_survival'],
+            key=lambda x: max(x[1]['lifetime_stats']['longest_survival'], 
+                            x[1]['current_character']['hours_survived'] if x[1]['current_character']['alive'] else 0),
             reverse=True
         )[:10]
         
@@ -255,10 +256,13 @@ def send_leaderboard(leaderboard_type="death"):
         for i, (name, data) in enumerate(sorted_players):
             medal = medals[i] if i < 3 else f"**{i+1}.**"
             longest = data['lifetime_stats']['longest_survival']
-            if longest == 0:
+            current = data['current_character']['hours_survived'] if data['current_character']['alive'] else 0
+            display_hours = max(longest, current)
+            
+            if display_hours == 0:
                 continue
             alive_marker = " 🟢" if data['current_character']['alive'] else ""
-            lines.append(f"{medal} {name}: {format_time(longest)}{alive_marker}")
+            lines.append(f"{medal} {name}: {format_time(display_hours)}{alive_marker}")
         
         if not lines:
             return
