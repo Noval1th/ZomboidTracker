@@ -18,6 +18,7 @@ LOG_BASE_PATH = os.getenv('LOG_BASE_PATH', '/Logs')
 CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '30'))
 SKILL_NOTIFICATIONS = os.getenv('SKILL_NOTIFICATIONS', 'milestones')  # 'all', 'milestones', or 'none'
 PLAYER_STATS_FILE = 'player_stats.json'
+MANUAL_LEADERBOARD = os.getenv("LEADERBOARD", "False").lower() == "true"
 
 # Track last processed position per file
 file_positions = {}
@@ -118,6 +119,7 @@ def send_discord_notification(embed_data):
     try:
         response = requests.post(DISCORD_WEBHOOK_URL, json=payload)
         if response.status_code in [200, 204]:
+            print(f'The Notification went with status code: {response.status_code}')
             return True
         else:
             print(f"✗ Failed to send notification: {response.status_code}")
@@ -208,6 +210,7 @@ def send_skill_notification(username, skill, level, hours_survived):
 def send_leaderboard(leaderboard_type="death"):
     """Send various leaderboards to Discord"""
     if not player_stats:
+        print('no player stats')
         return
     
     if leaderboard_type == "death":
@@ -219,6 +222,7 @@ def send_leaderboard(leaderboard_type="death"):
         )[:10]
         
         if not sorted_players:
+            print('no sorted players')
             return
         
         lines = []
@@ -239,13 +243,20 @@ def send_leaderboard(leaderboard_type="death"):
         }
     
     elif leaderboard_type == "survival":
-        # Longest survival streaks - use current hours for alive players
-        sorted_players = sorted(
-            [(name, data) for name, data in player_stats.items()],
-            key=lambda x: max(x[1]['lifetime_stats']['longest_survival'], 
-                            x[1]['current_character']['hours_survived'] if x[1]['current_character']['alive'] else 0),
-            reverse=True
-        )[:10]
+        # FIX 2: Include current survival time for living characters
+        player_survival_data = []
+        for name, data in player_stats.items():
+            if data['current_character']['alive']:
+                # Use current calculated survival time for living players
+                current_hours = get_current_survival_hours(data)
+                player_survival_data.append((name, current_hours, True))
+            else:
+                # Use longest survival for dead players
+                longest = data['lifetime_stats']['longest_survival']
+                if longest > 0:
+                    player_survival_data.append((name, longest, False))
+        
+        sorted_players = sorted(player_survival_data, key=lambda x: x[1], reverse=True)[:10]
         
         if not sorted_players:
             return
@@ -253,18 +264,15 @@ def send_leaderboard(leaderboard_type="death"):
         lines = []
         medals = ["🥇", "🥈", "🥉"]
         
-        for i, (name, data) in enumerate(sorted_players):
-            medal = medals[i] if i < 3 else f"**{i+1}.**"
-            longest = data['lifetime_stats']['longest_survival']
-            current = data['current_character']['hours_survived'] if data['current_character']['alive'] else 0
-            display_hours = max(longest, current)
-            
-            if display_hours == 0:
+        for i, (name, hours, is_alive) in enumerate(sorted_players):
+            if hours == 0:
                 continue
-            alive_marker = " 🟢" if data['current_character']['alive'] else ""
-            lines.append(f"{medal} {name}: {format_time(display_hours)}{alive_marker}")
+            medal = medals[i] if i < 3 else f"**{i+1}.**"
+            alive_marker = " 🟢" if is_alive else ""
+            lines.append(f"{medal} {name}: {format_time(hours)}{alive_marker}")
         
         if not lines:
+            print('no lines')
             return
         
         embed = {
@@ -276,12 +284,20 @@ def send_leaderboard(leaderboard_type="death"):
         }
     
     elif leaderboard_type == "hours":
-        # Total hours survived
-        sorted_players = sorted(
-            [(name, data) for name, data in player_stats.items() if data['lifetime_stats']['total_hours_survived'] > 0],
-            key=lambda x: x[1]['lifetime_stats']['total_hours_survived'],
-            reverse=True
-        )[:10]
+        # FIX 3: Add current survival to total hours for living players
+        player_hours_data = []
+        for name, data in player_stats.items():
+            total_hours = data['lifetime_stats']['total_hours_survived']
+            
+            # Add current survival time if alive
+            if data['current_character']['alive']:
+                current_hours = get_current_survival_hours(data)
+                total_hours += current_hours
+            
+            if total_hours > 0:
+                player_hours_data.append((name, total_hours))
+        
+        sorted_players = sorted(player_hours_data, key=lambda x: x[1], reverse=True)[:10]
         
         if not sorted_players:
             return
@@ -289,9 +305,8 @@ def send_leaderboard(leaderboard_type="death"):
         lines = []
         medals = ["🥇", "🥈", "🥉"]
         
-        for i, (name, data) in enumerate(sorted_players):
+        for i, (name, total_hours) in enumerate(sorted_players):
             medal = medals[i] if i < 3 else f"**{i+1}.**"
-            total_hours = data['lifetime_stats']['total_hours_survived']
             lines.append(f"{medal} {name}: {format_time(total_hours)}")
         
         embed = {
@@ -303,21 +318,16 @@ def send_leaderboard(leaderboard_type="death"):
         }
     
     elif leaderboard_type.startswith("skill_"):
-        # Skill-specific leaderboard
+        # FIX 4: Only show skills from ALIVE characters
         skill_name = leaderboard_type.replace("skill_", "")
         
-        # Get players with this skill
         players_with_skill = []
         for name, data in player_stats.items():
+            # Only check alive characters for current skills
             if data['current_character']['alive']:
                 skill_level = data['current_character']['skills'].get(skill_name, 0)
                 if skill_level > 0:
                     players_with_skill.append((name, skill_level))
-            
-            # Also check lifetime milestones
-            milestone = data['lifetime_stats']['skill_milestones'].get(skill_name, 0)
-            if milestone > 0 and not data['current_character']['alive']:
-                players_with_skill.append((name, milestone))
         
         if not players_with_skill:
             return
@@ -348,9 +358,11 @@ def send_leaderboard(leaderboard_type="death"):
             "description": "\n".join(lines),
             "color": 0x1E90FF,
             "timestamp": datetime.utcnow().isoformat(),
-            "footer": {"text": f"Highest {skill_name} levels"}
+            "footer": {"text": f"Highest {skill_name} levels (living characters only)"}
         }
     
+    print(embed)
+    print('This is the call before the return in send_leaderboard')
     return send_discord_notification(embed)
 
 def parse_perklog_line(line):
@@ -430,7 +442,10 @@ def handle_death_event(event_data):
     if hours_survived > player['lifetime_stats']['longest_survival']:
         player['lifetime_stats']['longest_survival'] = hours_survived
     
-    unsaved_changes = True  # Mark data as changed
+    # FIX 1: Clear skills when character dies
+    player['current_character']['skills'] = {}
+    
+    unsaved_changes = True
     
     print(f"💀 Death: {username} survived {format_time(hours_survived)} (Death #{player['total_deaths']})")
     send_death_notification(username, hours_survived, coordinates)
@@ -525,6 +540,26 @@ def handle_login_event(event_data):
         unsaved_changes = True  # Mark data as changed
     
     print(f"👋 Login: {username} ({format_time(event_data['hours_survived'])} survived)")
+
+def get_current_survival_hours(player_data):
+    """Calculate current survival hours for a living character"""
+    if not player_data['current_character']['alive']:
+        return 0
+    
+    spawn_time_str = player_data['current_character'].get('spawn_time')
+    if not spawn_time_str:
+        return player_data['current_character'].get('hours_survived', 0)
+    
+    try:
+        spawn_time = datetime.fromisoformat(spawn_time_str)
+        time_alive = datetime.now() - spawn_time
+        hours_from_spawn = time_alive.total_seconds() / 3600
+        
+        # Add any hours from the last recorded survival time
+        base_hours = player_data['current_character'].get('hours_survived', 0)
+        return base_hours + hours_from_spawn
+    except:
+        return player_data['current_character'].get('hours_survived', 0)
 
 def get_log_folders_to_check(ftp):
     """Get list of log folders to check"""
@@ -625,6 +660,7 @@ def download_log_tail(ftp, log_path, from_position=0):
         return None, from_position
 
 def monitor_server():
+    global MANUAL_LEADERBOARD
     """Main monitoring loop"""
     global last_events, file_positions
     
@@ -733,18 +769,13 @@ def monitor_server():
                         send_leaderboard("survival")
                         time.sleep(2)
                         send_leaderboard("hours")
+                        time.sleep(2)
+                        top_skills = ['Cooking', 'Fitness', 'Strength', 'Blunt', 'Axe', 'Sprinting', 'Lightfoot', 'Nimble', 'Sneak', 'Woodwork', 'Aiming', 'Reloading', 'Farming', 'Fishing', 'Trapping', 'PlantScavenging', 'Doctor', 'Electricity', 'MetalWelding', 'Mechanics', 'Spear', 'Maintenance', 'SmallBlade', 'LongBlade', 'SmallBlunt', 'Tailoring']
+                        for skill in top_skills:
+                            send_leaderboard(f"skill_{skill}")
+                        time.sleep(2)
                         last_daily_leaderboard_date = current_date
                         events_since_last_leaderboard = False
-            
-            # Weekly skill leaderboards (Sunday at midnight)
-            if current_weekday == 6 and current_hour == 0 and current_minute == 0:
-                if last_weekly_leaderboard_date != current_date and player_stats:
-                    print(f"\n📊 Sending weekly skill leaderboards...")
-                    top_skills = ['Aiming', 'Fitness', 'Strength', 'Cooking', 'Mechanics']
-                    for skill in top_skills:
-                        send_leaderboard(f"skill_{skill}")
-                        time.sleep(2)
-                    last_weekly_leaderboard_date = current_date
             
             # Activity-based leaderboard
             check_count += 1
@@ -752,8 +783,39 @@ def monitor_server():
                 if events_since_last_leaderboard and player_stats:
                     print(f"\n📊 Sending activity-based leaderboard...")
                     send_leaderboard("death")
+                    time.sleep(2)
+                    send_leaderboard("survival")
+                    time.sleep(2)
+                    send_leaderboard("hours")
+                    time.sleep(2)
                     events_since_last_leaderboard = False
-            
+            # Manual Leaderboard invoked
+            if MANUAL_LEADERBOARD:
+                print("Sending Death board")
+                send_leaderboard("death")
+                print("Sent Death board")
+                time.sleep(2)
+                print("Sending Survival board")
+                send_leaderboard("survival")
+                print("Sent Survival board")
+                time.sleep(2)
+                print("Sending Hours board")
+                send_leaderboard("hours")
+                print("Sent Hours board")
+                time.sleep(2)
+
+                top_skills = [
+                    'Cooking', 'Fitness', 'Strength', 'Blunt', 'Axe', 'Sprinting',
+                    'Lightfoot', 'Nimble', 'Sneak', 'Woodwork', 'Aiming', 'Reloading',
+                    'Farming', 'Fishing', 'Trapping', 'PlantScavenging', 'Doctor',
+                    'Electricity', 'MetalWelding', 'Mechanics', 'Spear', 'Maintenance',
+                    'SmallBlade', 'LongBlade', 'SmallBlunt', 'Tailoring'
+                ]
+                for skill in top_skills:
+                    send_leaderboard(f"skill_{skill}")
+                time.sleep(2)
+                MANUAL_LEADERBOARD = False          
+                        
             # Save stats periodically (only if there are unsaved changes)
             if check_count % 10 == 0 and unsaved_changes:
                 print("💾 Periodic save (unsaved changes detected)")
@@ -791,5 +853,5 @@ if __name__ == "__main__":
             print(f"  - {var}")
         print("\nPlease set these environment variables before running.")
         exit(1)
-    
+        
     monitor_server()
