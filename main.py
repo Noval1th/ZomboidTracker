@@ -23,6 +23,7 @@ PLAYER_STATS_FILE = 'player_stats.json'
 file_positions = {}
 last_events = set()  # Prevent duplicate notifications
 player_stats = {}  # Complete player statistics
+unsaved_changes = False  # Track if we have unsaved data
 
 # Skill milestone levels (for notifications)
 SKILL_MILESTONES = [5, 10]
@@ -44,12 +45,14 @@ def load_player_stats():
 
 def save_player_stats():
     """Save player statistics to file"""
+    global unsaved_changes
     try:
         with open(PLAYER_STATS_FILE, 'w') as f:
             json.dump({
                 'player_stats': player_stats,
                 'file_positions': file_positions
             }, f, indent=2)
+        unsaved_changes = False  # Mark as saved
     except Exception as e:
         print(f"⚠️ Could not save player stats: {e}")
 
@@ -349,10 +352,11 @@ def send_leaderboard(leaderboard_type="death"):
 def parse_perklog_line(line):
     """
     Parse a line from PerkLog.txt
-    Format: [timestamp][SteamID][Username][X,Y,Z][EventType][Details][Hours Survived: X]
+    Format: [timestamp][SteamID][Username][X,Y,Z][EventType][Details][Hours Survived: X].
+    Note: There may be spaces between brackets!
     """
-    # General pattern to extract core components
-    pattern = r'\[(.*?)\]\[(.*?)\]\[(.*?)\]\[(\d+),(\d+),(\d+)\]\[(.*?)\](?:\[(.*?)\])?\[Hours Survived: ([\d.]+)\]'
+    # Pattern allows optional whitespace between any brackets
+    pattern = r'\[(.*?)\]\s*\[(.*?)\]\s*\[(.*?)\]\s*\[(\d+),(\d+),(\d+)\]\s*\[(.*?)\].*?\[Hours Survived: ([\d.]+)\]\.?'
     
     match = re.search(pattern, line)
     if not match:
@@ -363,10 +367,22 @@ def parse_perklog_line(line):
     username = match.group(3)
     x, y, z = match.group(4), match.group(5), match.group(6)
     event_type = match.group(7)
-    details = match.group(8) if match.group(8) else ""
-    hours_survived = float(match.group(9))
+    hours_survived = float(match.group(8))
     
     coordinates = f"({x}, {y}, {z})"
+    
+    # For details, we need to extract what's between event_type and Hours Survived
+    # This could be another bracketed section or nothing
+    details = ""
+    if event_type == "Level Changed":
+        # Extract skill and level from the line
+        level_pattern = r'\[Level Changed\]\[(.*?)\]\[(\d+)\]'
+        level_match = re.search(level_pattern, line)
+        if level_match:
+            details = f"{level_match.group(1)}][{level_match.group(2)}"
+    elif event_type.startswith("Created Player"):
+        # Extract the full skill dump from the NEXT line if it exists (handled elsewhere)
+        pass
     
     return {
         'timestamp': timestamp,
@@ -391,6 +407,7 @@ def parse_skills_from_details(details):
 
 def handle_death_event(event_data):
     """Handle a player death event"""
+    global unsaved_changes
     username = event_data['username']
     steam_id = event_data['steam_id']
     hours_survived = event_data['hours_survived']
@@ -409,12 +426,15 @@ def handle_death_event(event_data):
     if hours_survived > player['lifetime_stats']['longest_survival']:
         player['lifetime_stats']['longest_survival'] = hours_survived
     
+    unsaved_changes = True  # Mark data as changed
+    
     print(f"💀 Death: {username} survived {format_time(hours_survived)} (Death #{player['total_deaths']})")
     send_death_notification(username, hours_survived, coordinates)
     save_player_stats()
 
 def handle_spawn_event(event_data):
     """Handle a new character spawn event"""
+    global unsaved_changes
     username = event_data['username']
     steam_id = event_data['steam_id']
     
@@ -435,6 +455,8 @@ def handle_spawn_event(event_data):
         skills = parse_skills_from_details(event_data['details'])
         player['current_character']['skills'] = skills
     
+    unsaved_changes = True  # Mark data as changed
+    
     character_num = player['total_respawns']
     print(f"🔄 Respawn: {username} (Character #{character_num})")
     send_respawn_notification(username, character_num)
@@ -442,6 +464,7 @@ def handle_spawn_event(event_data):
 
 def handle_level_change_event(event_data):
     """Handle a skill level-up event"""
+    global unsaved_changes
     username = event_data['username']
     steam_id = event_data['steam_id']
     hours_survived = event_data['hours_survived']
@@ -464,6 +487,8 @@ def handle_level_change_event(event_data):
         if level > current_milestone:
             player['lifetime_stats']['skill_milestones'][skill] = level
         
+        unsaved_changes = True  # Mark data as changed
+        
         print(f"📈 Level Up: {username} - {skill} level {level}")
         
         # Send notification based on settings
@@ -480,6 +505,7 @@ def handle_level_change_event(event_data):
 
 def handle_login_event(event_data):
     """Handle a player login event"""
+    global unsaved_changes
     username = event_data['username']
     steam_id = event_data['steam_id']
     
@@ -492,6 +518,7 @@ def handle_login_event(event_data):
         player['current_character']['skills'] = skills
         player['current_character']['alive'] = True
         player['current_character']['hours_survived'] = event_data['hours_survived']
+        unsaved_changes = True  # Mark data as changed
     
     print(f"👋 Login: {username} ({format_time(event_data['hours_survived'])} survived)")
 
@@ -570,6 +597,8 @@ def download_log_tail(ftp, log_path, from_position=0):
             print(f"✗ Could not determine size of {log_path}")
             return None, from_position
         
+        print(f"DEBUG - File: {log_path}, Size: {file_size}, From: {from_position}")
+        
         if file_size < from_position:
             from_position = 0
             print(f"ℹ️ Log file {log_path} rotated, starting from beginning")
@@ -582,6 +611,8 @@ def download_log_tail(ftp, log_path, from_position=0):
         
         content = buffer.getvalue().decode('utf-8', errors='ignore')
         new_position = file_size
+        
+        print(f"DEBUG - Downloaded {len(content)} bytes")
         
         return content, new_position
         
@@ -645,9 +676,15 @@ def monitor_server():
                                 if not line.strip():
                                     continue
                                 
+                                # Debug: print first few lines to see format
+                                if check_count == 0:
+                                    print(f"DEBUG - Processing line: {line[:100]}")
+                                
                                 event_data = parse_perklog_line(line)
                                 
                                 if event_data:
+                                    print(f"✓ Parsed event: {event_data['event_type']} - {event_data['username']}")
+                                    
                                     # Create unique event ID
                                     event_id = f"{event_data['username']}_{event_data['event_type']}_{event_data['timestamp']}"
                                     
@@ -713,8 +750,9 @@ def monitor_server():
                     send_leaderboard("death")
                     events_since_last_leaderboard = False
             
-            # Save stats periodically
-            if check_count % 10 == 0:
+            # Save stats periodically (only if there are unsaved changes)
+            if check_count % 10 == 0 and unsaved_changes:
+                print("💾 Periodic save (unsaved changes detected)")
                 save_player_stats()
             
             time.sleep(CHECK_INTERVAL)
