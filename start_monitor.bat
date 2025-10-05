@@ -10,6 +10,7 @@ set FTP_HOST=
 set FTP_PORT=
 set FTP_USER=
 set FTP_PASS=
+set LEADERBOARD=
 
 REM ===== OPTIONAL SETTINGS =====
 
